@@ -31,3 +31,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# docs unnecessary files
+docs/
