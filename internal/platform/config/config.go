@@ -5,6 +5,7 @@ import "os"
 type Config struct {
 	Port         string
 	SeedTenantID string
+	DBURL        string
 }
 
 func Load() Config {
@@ -18,8 +19,11 @@ func Load() Config {
 		seedTenantID = "tenant-demo"
 	}
 
+	dbURL := os.Getenv("DB_URL")
+
 	return Config{
 		Port:         port,
 		SeedTenantID: seedTenantID,
+		DBURL:        dbURL,
 	}
 }

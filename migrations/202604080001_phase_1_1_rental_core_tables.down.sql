@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS fee_lines;
+DROP TABLE IF EXISTS rental_items;
+DROP TABLE IF EXISTS rentals;
+DROP TABLE IF EXISTS product_items;
