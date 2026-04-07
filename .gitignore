@@ -1,1 +1,33 @@
+# Environment
 .env
+.env.*
+!.env.example
+
+# Build outputs
+bin/
+dist/
+build/
+tmp/
+
+# Go tooling
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.txt
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
