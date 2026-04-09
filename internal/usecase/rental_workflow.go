@@ -375,3 +375,251 @@ func (u *RentalWorkflowUsecase) GetRental(ctx context.Context, tenantID, rentalI
 	}
 	return u.rentalRepo.GetByID(ctx, tenantID, rentalID)
 }
+
+type ExtendRentalInput struct {
+	TenantID string    `json:"tenant_id"`
+	RentalID string    `json:"rental_id"`
+	Actor    string    `json:"actor"`
+	Reason   string    `json:"reason"`
+	NewDueAt time.Time `json:"new_due_at"`
+}
+
+func (u *RentalWorkflowUsecase) ExtendRental(ctx context.Context, input ExtendRentalInput) (domain.Rental, error) {
+	if input.TenantID == "" || input.RentalID == "" || input.NewDueAt.IsZero() {
+		return domain.Rental{}, domain.ErrInvalidInput
+	}
+
+	rental, err := u.rentalRepo.GetByID(ctx, input.TenantID, input.RentalID)
+	if err != nil {
+		return domain.Rental{}, err
+	}
+
+	if rental.Status != domain.RentalStatusActive && rental.Status != domain.RentalStatusPartiallyReturned {
+		return domain.Rental{}, domain.ErrRentalStatusInvalid
+	}
+
+	if !input.NewDueAt.After(rental.DueAt) {
+		return domain.Rental{}, domain.ErrExtensionInvalidDate
+	}
+
+	outstanding := make([]string, 0, len(rental.RentalItems))
+	for _, item := range rental.RentalItems {
+		if item.Status == domain.RentalItemStatusReserved || item.Status == domain.RentalItemStatusRented {
+			outstanding = append(outstanding, item.ProductItemID)
+		}
+	}
+
+	if len(outstanding) > 0 {
+		conflict, err := u.rentalRepo.HasActiveScheduleConflict(ctx, input.TenantID, outstanding, rental.StartAt, input.NewDueAt, rental.ID)
+		if err != nil {
+			return domain.Rental{}, err
+		}
+		if conflict {
+			return domain.Rental{}, domain.ErrExtensionConflict
+		}
+	}
+
+	plannedDays := int(math.Ceil(input.NewDueAt.Sub(rental.StartAt).Hours() / 24))
+	if plannedDays < 1 {
+		plannedDays = 1
+	}
+
+	subtotal := 0.0
+	for i := range rental.RentalItems {
+		rental.RentalItems[i].PlannedDays = plannedDays
+		rental.RentalItems[i].LineTotal = float64(plannedDays) * rental.RentalItems[i].DailyRate
+		subtotal += rental.RentalItems[i].LineTotal
+	}
+
+	now := time.Now().UTC()
+	rental.DueAt = input.NewDueAt.UTC()
+	rental.Subtotal = subtotal
+	rental.GrandTotal = rental.Subtotal + rental.TotalFees
+	rental.UpdatedAt = now
+
+	saved, err := u.rentalRepo.Update(ctx, rental)
+	if err != nil {
+		return domain.Rental{}, err
+	}
+
+	_ = u.auditRepo.Append(ctx, port.AuditLogEntry{
+		TenantID:   input.TenantID,
+		ActorUser:  input.Actor,
+		Action:     "rental.extended",
+		Entity:     "rental",
+		EntityID:   saved.ID,
+		OccurredAt: now,
+		Payload: map[string]any{
+			"reason":      input.Reason,
+			"new_due_at":  saved.DueAt,
+			"item_count":  len(saved.RentalItems),
+			"grand_total": saved.GrandTotal,
+		},
+	})
+
+	return saved, nil
+}
+
+type CancelRentalInput struct {
+	TenantID string `json:"tenant_id"`
+	RentalID string `json:"rental_id"`
+	Actor    string `json:"actor"`
+	Reason   string `json:"reason"`
+}
+
+func (u *RentalWorkflowUsecase) CancelRental(ctx context.Context, input CancelRentalInput) (domain.Rental, error) {
+	if input.TenantID == "" || input.RentalID == "" {
+		return domain.Rental{}, domain.ErrInvalidInput
+	}
+
+	rental, err := u.rentalRepo.GetByID(ctx, input.TenantID, input.RentalID)
+	if err != nil {
+		return domain.Rental{}, err
+	}
+
+	if rental.Status != domain.RentalStatusDraft && rental.Status != domain.RentalStatusReserved {
+		return domain.Rental{}, domain.ErrRentalStatusInvalid
+	}
+
+	reservedItemIDs := make([]string, 0, len(rental.RentalItems))
+	for i := range rental.RentalItems {
+		if rental.RentalItems[i].Status == domain.RentalItemStatusReserved {
+			reservedItemIDs = append(reservedItemIDs, rental.RentalItems[i].ProductItemID)
+		}
+	}
+
+	if len(reservedItemIDs) > 0 {
+		if err := u.inventoryRepo.TransitionItemsStatus(ctx, input.TenantID, reservedItemIDs, domain.ItemStatusReserved, domain.ItemStatusAvailable); err != nil {
+			return domain.Rental{}, err
+		}
+	}
+
+	now := time.Now().UTC()
+	rental.Status = domain.RentalStatusCancelled
+	rental.UpdatedAt = now
+
+	saved, err := u.rentalRepo.Update(ctx, rental)
+	if err != nil {
+		return domain.Rental{}, err
+	}
+
+	_ = u.auditRepo.Append(ctx, port.AuditLogEntry{
+		TenantID:   input.TenantID,
+		ActorUser:  input.Actor,
+		Action:     "rental.cancelled",
+		Entity:     "rental",
+		EntityID:   saved.ID,
+		OccurredAt: now,
+		Payload: map[string]any{
+			"reason": input.Reason,
+		},
+	})
+
+	return saved, nil
+}
+
+type LostItemInput struct {
+	ProductItemID string  `json:"product_item_id"`
+	Compensation  float64 `json:"compensation"`
+	Notes         string  `json:"notes"`
+}
+
+type MarkLostItemsInput struct {
+	TenantID string          `json:"tenant_id"`
+	RentalID string          `json:"rental_id"`
+	Actor    string          `json:"actor"`
+	Items    []LostItemInput `json:"items"`
+}
+
+func (u *RentalWorkflowUsecase) MarkLostItems(ctx context.Context, input MarkLostItemsInput) (domain.Rental, error) {
+	if input.TenantID == "" || input.RentalID == "" || len(input.Items) == 0 {
+		return domain.Rental{}, domain.ErrInvalidInput
+	}
+
+	rental, err := u.rentalRepo.GetByID(ctx, input.TenantID, input.RentalID)
+	if err != nil {
+		return domain.Rental{}, err
+	}
+
+	if rental.Status != domain.RentalStatusActive && rental.Status != domain.RentalStatusPartiallyReturned {
+		return domain.Rental{}, domain.ErrRentalStatusInvalid
+	}
+
+	itemIndex := make(map[string]int, len(rental.RentalItems))
+	for i := range rental.RentalItems {
+		itemIndex[rental.RentalItems[i].ProductItemID] = i
+	}
+
+	now := time.Now().UTC()
+	for _, lost := range input.Items {
+		idx, ok := itemIndex[lost.ProductItemID]
+		if !ok {
+			return domain.Rental{}, domain.ErrItemNotInRental
+		}
+
+		if rental.RentalItems[idx].Status == domain.RentalItemStatusReturned || rental.RentalItems[idx].Status == domain.RentalItemStatusLost {
+			return domain.Rental{}, domain.ErrRentalStatusInvalid
+		}
+
+		rental.RentalItems[idx].Status = domain.RentalItemStatusLost
+		rental.RentalItems[idx].ReturnedAt = &now
+		rental.RentalItems[idx].ReturnCondition = "lost"
+
+		if err := u.inventoryRepo.SetItemStatus(ctx, input.TenantID, lost.ProductItemID, domain.ItemStatusLost); err != nil {
+			return domain.Rental{}, err
+		}
+
+		if lost.Compensation > 0 {
+			rental.FeeLines = append(rental.FeeLines, domain.FeeLine{
+				ID:           uuid.NewString(),
+				RentalID:     rental.ID,
+				RentalItemID: rental.RentalItems[idx].ID,
+				FeeType:      domain.FeeTypeOther,
+				Amount:       lost.Compensation,
+				Notes:        "lost item compensation: " + strings.TrimSpace(lost.Notes),
+				CreatedBy:    input.Actor,
+				CreatedAt:    now,
+			})
+		}
+	}
+
+	allSettled := true
+	for _, item := range rental.RentalItems {
+		if item.Status != domain.RentalItemStatusReturned && item.Status != domain.RentalItemStatusLost {
+			allSettled = false
+			break
+		}
+	}
+
+	rental.Status = domain.RentalStatusPartiallyReturned
+	if allSettled {
+		rental.ReturnedAt = &now
+	}
+
+	totalFees := 0.0
+	for _, fee := range rental.FeeLines {
+		totalFees += fee.Amount
+	}
+	rental.TotalFees = totalFees
+	rental.GrandTotal = rental.Subtotal + totalFees
+	rental.UpdatedAt = now
+
+	saved, err := u.rentalRepo.Update(ctx, rental)
+	if err != nil {
+		return domain.Rental{}, err
+	}
+
+	_ = u.auditRepo.Append(ctx, port.AuditLogEntry{
+		TenantID:   input.TenantID,
+		ActorUser:  input.Actor,
+		Action:     "rental.item_lost",
+		Entity:     "rental",
+		EntityID:   saved.ID,
+		OccurredAt: now,
+		Payload: map[string]any{
+			"lost_item_count": len(input.Items),
+		},
+	})
+
+	return saved, nil
+}

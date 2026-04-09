@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -155,6 +156,27 @@ func (r *RentalRepository) Update(ctx context.Context, rental domain.Rental) (do
 		return domain.Rental{}, err
 	}
 	return rental, nil
+}
+
+func (r *RentalRepository) HasActiveScheduleConflict(ctx context.Context, tenantID string, itemIDs []string, fromAt, toAt time.Time, excludeRentalID string) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM rentals r
+			JOIN rental_items ri ON ri.rental_id = r.id AND ri.tenant_id = r.tenant_id
+			WHERE r.tenant_id = $1
+			  AND r.id <> $2
+			  AND ri.product_item_id = ANY($3)
+			  AND r.status IN ('reserved', 'active', 'partially_returned')
+			  AND r.start_at < $5
+			  AND r.due_at > $4
+		)
+	`, tenantID, excludeRentalID, itemIDs, fromAt, toAt).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func fetchRental(ctx context.Context, q queryer, tenantID, rentalID string) (domain.Rental, error) {

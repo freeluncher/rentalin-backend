@@ -19,6 +19,7 @@ type RentalRepository interface {
 	GetByID(ctx context.Context, tenantID, rentalID string) (domain.Rental, error)
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.Rental, error)
 	Update(ctx context.Context, rental domain.Rental) (domain.Rental, error)
+	HasActiveScheduleConflict(ctx context.Context, tenantID string, itemIDs []string, fromAt, toAt time.Time, excludeRentalID string) (bool, error)
 }
 
 type AuditLogEntry struct {

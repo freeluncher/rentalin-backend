@@ -52,13 +52,39 @@ type closeRequest struct {
 	Actor    string `json:"actor"`
 }
 
+type extensionRequest struct {
+	TenantID string `json:"tenant_id"`
+	Actor    string `json:"actor"`
+	Reason   string `json:"reason"`
+	NewDueAt string `json:"new_due_at"`
+}
+
+type cancelRequest struct {
+	TenantID string `json:"tenant_id"`
+	Actor    string `json:"actor"`
+	Reason   string `json:"reason"`
+}
+
+type lostItemsRequest struct {
+	TenantID string `json:"tenant_id"`
+	Actor    string `json:"actor"`
+	Items    []struct {
+		ProductItemID string  `json:"product_item_id"`
+		Compensation  float64 `json:"compensation"`
+		Notes         string  `json:"notes"`
+	} `json:"items"`
+}
+
 func (h *RentalHandler) RegisterRoutes(router fiber.Router) {
 	router.Get("/availability", h.CheckAvailability)
 	router.Post("/rentals", h.CreateRental)
 	router.Get("/rentals", h.ListRentals)
 	router.Get("/rentals/:id", h.GetRental)
 	router.Post("/rentals/:id/checkout", h.CheckoutRental)
+	router.Post("/rentals/:id/extensions", h.ExtendRental)
+	router.Post("/rentals/:id/cancel", h.CancelRental)
 	router.Post("/rentals/:id/returns", h.ProcessReturn)
+	router.Post("/rentals/:id/lost-items", h.MarkLostItems)
 	router.Post("/rentals/:id/close", h.CloseRental)
 }
 
@@ -198,6 +224,78 @@ func (h *RentalHandler) ProcessReturn(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{"success": true, "data": rental})
 }
 
+func (h *RentalHandler) ExtendRental(c *fiber.Ctx) error {
+	var req extensionRequest
+	if err := c.BodyParser(&req); err != nil {
+		return respondError(c, fiber.StatusBadRequest, "INVALID_PAYLOAD", "invalid request payload")
+	}
+
+	newDueAt, err := time.Parse(time.RFC3339, req.NewDueAt)
+	if err != nil {
+		return respondError(c, fiber.StatusBadRequest, "INVALID_INPUT", "new_due_at must be RFC3339")
+	}
+
+	rental, err := h.workflow.ExtendRental(c.UserContext(), usecase.ExtendRentalInput{
+		TenantID: req.TenantID,
+		RentalID: c.Params("id"),
+		Actor:    req.Actor,
+		Reason:   req.Reason,
+		NewDueAt: newDueAt,
+	})
+	if err != nil {
+		return respondDomainError(c, err)
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"success": true, "data": rental})
+}
+
+func (h *RentalHandler) CancelRental(c *fiber.Ctx) error {
+	var req cancelRequest
+	if err := c.BodyParser(&req); err != nil {
+		return respondError(c, fiber.StatusBadRequest, "INVALID_PAYLOAD", "invalid request payload")
+	}
+
+	rental, err := h.workflow.CancelRental(c.UserContext(), usecase.CancelRentalInput{
+		TenantID: req.TenantID,
+		RentalID: c.Params("id"),
+		Actor:    req.Actor,
+		Reason:   req.Reason,
+	})
+	if err != nil {
+		return respondDomainError(c, err)
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"success": true, "data": rental})
+}
+
+func (h *RentalHandler) MarkLostItems(c *fiber.Ctx) error {
+	var req lostItemsRequest
+	if err := c.BodyParser(&req); err != nil {
+		return respondError(c, fiber.StatusBadRequest, "INVALID_PAYLOAD", "invalid request payload")
+	}
+
+	items := make([]usecase.LostItemInput, 0, len(req.Items))
+	for _, item := range req.Items {
+		items = append(items, usecase.LostItemInput{
+			ProductItemID: item.ProductItemID,
+			Compensation:  item.Compensation,
+			Notes:         item.Notes,
+		})
+	}
+
+	rental, err := h.workflow.MarkLostItems(c.UserContext(), usecase.MarkLostItemsInput{
+		TenantID: req.TenantID,
+		RentalID: c.Params("id"),
+		Actor:    req.Actor,
+		Items:    items,
+	})
+	if err != nil {
+		return respondDomainError(c, err)
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"success": true, "data": rental})
+}
+
 func (h *RentalHandler) CloseRental(c *fiber.Ctx) error {
 	var req closeRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -227,6 +325,10 @@ func respondDomainError(c *fiber.Ctx, err error) error {
 		return respondError(c, fiber.StatusConflict, "RETURN_ALREADY_PROCESSED", err.Error())
 	case errors.Is(err, domain.ErrSettlementIncomplete):
 		return respondError(c, fiber.StatusConflict, "SETTLEMENT_INCOMPLETE", err.Error())
+	case errors.Is(err, domain.ErrExtensionConflict):
+		return respondError(c, fiber.StatusConflict, "EXTENSION_CONFLICT", err.Error())
+	case errors.Is(err, domain.ErrExtensionInvalidDate):
+		return respondError(c, fiber.StatusBadRequest, "EXTENSION_INVALID_DATE", err.Error())
 	default:
 		return respondError(c, fiber.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")
 	}

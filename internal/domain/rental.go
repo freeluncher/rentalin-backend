@@ -101,4 +101,6 @@ var (
 	ErrItemNotInRental      = errors.New("item not in rental")
 	ErrReturnAlreadyHandled = errors.New("return already processed")
 	ErrSettlementIncomplete = errors.New("settlement incomplete")
+	ErrExtensionConflict    = errors.New("extension conflict")
+	ErrExtensionInvalidDate = errors.New("extension invalid date")
 )

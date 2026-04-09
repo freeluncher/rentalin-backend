@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/freeluncher/rentalin-backend/internal/domain"
 )
@@ -57,4 +58,35 @@ func (r *RentalRepository) Update(_ context.Context, rental domain.Rental) (doma
 	}
 	r.rentals[rental.ID] = rental
 	return rental, nil
+}
+
+func (r *RentalRepository) HasActiveScheduleConflict(_ context.Context, tenantID string, itemIDs []string, fromAt, toAt time.Time, excludeRentalID string) (bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	itemSet := make(map[string]struct{}, len(itemIDs))
+	for _, id := range itemIDs {
+		itemSet[id] = struct{}{}
+	}
+
+	for _, rental := range r.rentals {
+		if rental.TenantID != tenantID || rental.ID == excludeRentalID {
+			continue
+		}
+		if rental.Status != domain.RentalStatusReserved && rental.Status != domain.RentalStatusActive && rental.Status != domain.RentalStatusPartiallyReturned {
+			continue
+		}
+
+		if !(rental.StartAt.Before(toAt) && rental.DueAt.After(fromAt)) {
+			continue
+		}
+
+		for _, item := range rental.RentalItems {
+			if _, ok := itemSet[item.ProductItemID]; ok {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
 }
